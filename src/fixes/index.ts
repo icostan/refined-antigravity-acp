@@ -17,6 +17,7 @@ import { missingQuestionFallbackFix } from "./missing-question-fallback/index.js
 import { prematureTurnStopFix } from "./premature-turn-stop/index.js";
 import { repetitiveToolLoopFix } from "./repetitive-tool-loop/index.js";
 import { gatedThirdPartyModelsFix } from "./gated-third-party-models/index.js";
+import { flattenedModelEffortsFix } from "./flattened-model-efforts/index.js";
 
 export * from "./missing-localharness/index.js";
 export * from "./missing-system-prompt/index.js";
@@ -60,6 +61,7 @@ export function createDefaultFixes(): AcpFix[] {
     orphanedCheckpointsFix,
     droppedHistoryChunksFix,
     noisyStderrLogsFix,
+    flattenedModelEffortsFix,
     gatedThirdPartyModelsFix,
     nonCanonicalModeIdsFix,
     missingQuestionFallbackFix,

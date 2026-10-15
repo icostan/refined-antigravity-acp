@@ -168,8 +168,8 @@ function recordSessionVariant(
     KNOWN_THINKING_MODELS_KEY,
     () => new Set<string>(),
   );
-  variants.set(`${parsed.baseModelId}:${parsed.effort}`, rawId);
   if (parsed.baseModelId !== rawId) {
+    variants.set(`${parsed.baseModelId}:${parsed.effort}`, rawId);
     knownThinking.add(parsed.baseModelId);
   }
 }
@@ -260,7 +260,12 @@ function injectEffort(
   effort: ReasoningEffortLevel,
 ): void {
   const exists = options.some(
-    (o) => o?.id === EFFORT_OPTION_ID || o?.category === EFFORT_OPTION_ID,
+    (o) =>
+      o?.id === EFFORT_OPTION_ID ||
+      o?.category === EFFORT_OPTION_ID ||
+      o?.id === "thinking_level" ||
+      o?.category === "thought_level" ||
+      o?.category === "thinking_level",
   );
   if (exists) return;
   options.splice(index + 1, 0, {
@@ -370,6 +375,14 @@ function handleSetConfig(
   const selectedBaseModel = getSelectedBaseModel(session);
   if (params.configId === "model") {
     handleModelConfig(params, session, val);
+  } else if (params.configId === "thinking_level") {
+    const effort = normalizeEffort(val);
+    setSelectedEffort(session, effort);
+    params.value = effort;
+    session.lastConfigOptions.set("thinking_level", {
+      value: effort,
+      type: typeof params.type === "string" ? params.type : "select",
+    });
   } else if (EFFORT_CONFIG_IDS.has(params.configId) && selectedBaseModel) {
     const effort = normalizeEffort(val);
     setSelectedEffort(session, effort);
