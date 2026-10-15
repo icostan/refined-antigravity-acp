@@ -18,6 +18,7 @@ import { prematureTurnStopFix } from "./premature-turn-stop/index.js";
 import { repetitiveToolLoopFix } from "./repetitive-tool-loop/index.js";
 import { gatedThirdPartyModelsFix } from "./gated-third-party-models/index.js";
 import { flattenedModelEffortsFix } from "./flattened-model-efforts/index.js";
+import { createTelemetryFix } from "../otel/index.js";
 
 export * from "./missing-localharness/index.js";
 export * from "./missing-system-prompt/index.js";
@@ -39,6 +40,7 @@ export * from "./missing-question-fallback/index.js";
 export * from "./premature-turn-stop/index.js";
 export * from "./repetitive-tool-loop/index.js";
 export * from "./gated-third-party-models/index.js";
+export * from "../otel/index.js";
 
 /**
  * Returns a list of all active fixes addressing the upstream issues documented in readme.md.
@@ -66,5 +68,6 @@ export function createDefaultFixes(): AcpFix[] {
     nonCanonicalModeIdsFix,
     missingQuestionFallbackFix,
     prematureTurnStopFix,
+    createTelemetryFix(),
   ];
 }
