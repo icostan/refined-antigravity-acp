@@ -579,4 +579,214 @@ describe("OpenTelemetry Telemetry Unit Tests", () => {
     const lenAttr = responseLog?.attributes.find((a) => a.key === "response_length");
     expect(lenAttr?.value).toEqual({ intValue: "Live response".length });
   });
+
+  it("tool span naming: resolves canonical tool name and stores command in attribute without command in span name", async () => {
+    collector = await createFakeCollector();
+    const endpoint = `http://127.0.0.1:${collector.port}`;
+    const config = getOtelConfig({ OTEL_EXPORTER_OTLP_ENDPOINT: endpoint });
+    const fix = createTelemetryFix({ config });
+    const context = createMockContext();
+
+    fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 801,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: { sessionId: "s-tool-names", prompt: "Execute tools" },
+      },
+      context,
+    );
+
+    // Tool 1: view_file with title "Running view_file"
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "s-tool-names",
+          update: {
+            sessionUpdate: SESSION_UPDATES.TOOL_CALL,
+            toolCallId: "call-view-1",
+            name: "view_file",
+            title: "Running view_file",
+            rawInput: { AbsolutePath: "/path/to/file.txt" },
+          },
+        },
+      },
+      context,
+    );
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "s-tool-names",
+          update: {
+            sessionUpdate: SESSION_UPDATES.TOOL_CALL_UPDATE,
+            toolCallId: "call-view-1",
+            status: "completed",
+          },
+        },
+      },
+      context,
+    );
+
+    // Tool 2: run_command where title is the full command line
+    const cmdLine = 'find /home/coder /tmp/agytest -name "a.txt" 2>/dev/null';
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "s-tool-names",
+          update: {
+            sessionUpdate: SESSION_UPDATES.TOOL_CALL,
+            toolCallId: "call-cmd-1",
+            name: "run_command",
+            title: cmdLine,
+            rawInput: { CommandLine: cmdLine },
+          },
+        },
+      },
+      context,
+    );
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        method: ACP_METHODS.SESSION_UPDATE,
+        params: {
+          sessionId: "s-tool-names",
+          update: {
+            sessionUpdate: SESSION_UPDATES.TOOL_CALL_UPDATE,
+            toolCallId: "call-cmd-1",
+            status: "completed",
+          },
+        },
+      },
+      context,
+    );
+
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 801,
+        result: { stopReason: "end_turn" },
+      },
+      context,
+    );
+    await fix.exporter.flush();
+
+    const viewSpan = collector.traces.find((s) => s.name === "execute_tool view_file");
+    const cmdSpan = collector.traces.find((s) => s.name === "execute_tool run_command");
+
+    expect(viewSpan).toBeDefined();
+    expect(cmdSpan).toBeDefined();
+
+    // Verify gen_ai.tool.name is clean tool identifier
+    const viewToolName = viewSpan?.attributes.find((a) => a.key === "gen_ai.tool.name");
+    const cmdToolName = cmdSpan?.attributes.find((a) => a.key === "gen_ai.tool.name");
+    expect(viewToolName?.value).toEqual({ stringValue: "view_file" });
+    expect(cmdToolName?.value).toEqual({ stringValue: "run_command" });
+
+    // Verify command line was placed into attribute, NOT the span name
+    const cmdAttr = cmdSpan?.attributes.find((a) => a.key === "tool.command");
+    expect(cmdAttr?.value).toEqual({ stringValue: cmdLine });
+    expect(collector.traces.some((s) => s.name.includes("find /home"))).toBe(false);
+  });
+
+  it("logged prompt: strips wrapper-injected <system_instruction> blocks from user prompt log", async () => {
+    collector = await createFakeCollector();
+    const endpoint = `http://127.0.0.1:${collector.port}`;
+    const config = getOtelConfig({
+      OTEL_EXPORTER_OTLP_ENDPOINT: endpoint,
+      OTEL_LOG_USER_PROMPTS: "1",
+    });
+    const fix = createTelemetryFix({ config });
+    const context = createMockContext();
+
+    const injectedPrompt = [
+      {
+        type: "text",
+        text: "<system_instruction>\n- Keep responses concise.\n- Always explain rationale.\n</system_instruction>\n\n<user_instruction>\nCustom persona\n</user_instruction>\n\nWhat is the status?",
+      },
+    ];
+
+    fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 901,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: { sessionId: "s-strip-sys", prompt: injectedPrompt },
+      },
+      context,
+    );
+
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 901,
+        result: { stopReason: "end_turn" },
+      },
+      context,
+    );
+    await fix.exporter.flush();
+
+    const promptLog = collector.logs.find(
+      (l) => l.body && "stringValue" in l.body && l.body.stringValue === "agy.user_prompt",
+    );
+    expect(promptLog).toBeDefined();
+
+    const promptText = promptLog?.attributes.find((a) => a.key === "prompt");
+    expect((promptText?.value as { stringValue?: string })?.stringValue).toBe(
+      "What is the status?",
+    );
+  });
+
+  it("cache read tokens: exports gen_ai.usage.cache_read.input_tokens when cached tokens are present", async () => {
+    collector = await createFakeCollector();
+    const endpoint = `http://127.0.0.1:${collector.port}`;
+    const config = getOtelConfig({ OTEL_EXPORTER_OTLP_ENDPOINT: endpoint });
+    const fix = createTelemetryFix({ config });
+    const context = createMockContext();
+
+    fix.onOutbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 902,
+        method: ACP_METHODS.SESSION_PROMPT,
+        params: { sessionId: "s-cache-tokens", prompt: "Hello cache" },
+      },
+      context,
+    );
+
+    await fix.onInbound?.(
+      {
+        jsonrpc: "2.0",
+        id: 902,
+        result: {
+          stopReason: "end_turn",
+          usage: {
+            inputTokens: 140000,
+            outputTokens: 350,
+            cachedTokens: 135000,
+          },
+        },
+      },
+      context,
+    );
+    await fix.exporter.flush();
+
+    const turnSpan = collector.traces.find((s) => s.name.startsWith("chat"));
+    expect(turnSpan).toBeDefined();
+
+    const inputTokens = turnSpan?.attributes.find((a) => a.key === "gen_ai.usage.input_tokens");
+    const outputTokens = turnSpan?.attributes.find((a) => a.key === "gen_ai.usage.output_tokens");
+    const cacheTokens = turnSpan?.attributes.find(
+      (a) => a.key === "gen_ai.usage.cache_read.input_tokens",
+    );
+
+    expect(inputTokens?.value).toEqual({ intValue: 140000 });
+    expect(outputTokens?.value).toEqual({ intValue: 350 });
+    expect(cacheTokens?.value).toEqual({ intValue: 135000 });
+  });
 });

@@ -20,6 +20,7 @@ import {
 import type { PromptContentItem } from "../core/types.js";
 import type { TokenUsage } from "../fixes/missing-usage-metrics/index.js";
 import { getLatestSessionUsage } from "../fixes/missing-usage-metrics/index.js";
+import { stripSystemContext } from "../fixes/missing-system-prompt/index.js";
 import { getConversationDbPath } from "../fixes/orphaned-checkpoints/index.js";
 import { getField, getVarintField } from "../lib/protobuf.js";
 
@@ -38,6 +39,7 @@ export function nowUnixNano(): string {
 export interface InFlightToolCall {
   toolCallId: string;
   toolName: string;
+  command?: string | undefined;
   spanId: string;
   startTimeUnixNano: string;
   endTimeUnixNano?: string;
@@ -63,21 +65,40 @@ export interface InFlightTurn {
   errorMessage?: string;
 }
 
-function readCachedTokensFromDb(dbPath: string): number | undefined {
+function parseVarintsFromField9(f9: Uint8Array): {
+  promptTokens?: number | undefined;
+  candidateTokens?: number | undefined;
+  cachedTokens?: number | undefined;
+} {
+  const promptTokens = getVarintField(f9, 2);
+  const candidateTokens = getVarintField(f9, 3);
+  const cachedTokens = getVarintField(f9, 5);
+  return {
+    promptTokens: typeof promptTokens === "number" ? promptTokens : undefined,
+    candidateTokens: typeof candidateTokens === "number" ? candidateTokens : undefined,
+    cachedTokens: typeof cachedTokens === "number" && cachedTokens > 0 ? cachedTokens : undefined,
+  };
+}
+
+export function readTokensFromDb(dbPath: string):
+  | {
+      promptTokens?: number | undefined;
+      candidateTokens?: number | undefined;
+      cachedTokens?: number | undefined;
+    }
+  | undefined {
   if (!existsSync(dbPath)) return undefined;
   let db: DatabaseSync | null = null;
   try {
     db = new DatabaseSync(dbPath, { timeout: 1000, readOnly: true });
     const row = db
       .prepare(
-        "SELECT metadata FROM steps WHERE step_type = 15 AND metadata IS NOT NULL ORDER BY idx DESC LIMIT 1;",
+        "SELECT metadata FROM steps WHERE step_type IN (15, 2) AND metadata IS NOT NULL ORDER BY idx DESC LIMIT 1;",
       )
       .get() as { metadata: Uint8Array | null } | undefined;
     if (!row?.metadata) return undefined;
     const f9 = getField(row.metadata, 9);
-    if (!f9) return undefined;
-    const f5 = getVarintField(f9, 5);
-    return typeof f5 === "number" && f5 > 0 ? f5 : undefined;
+    return f9 ? parseVarintsFromField9(f9) : undefined;
   } catch {
     return undefined;
   } finally {
@@ -85,24 +106,65 @@ function readCachedTokensFromDb(dbPath: string): number | undefined {
   }
 }
 
+function applyTokensToTurn(
+  turn: InFlightTurn,
+  tokens?:
+    | {
+        promptTokens?: number | undefined;
+        candidateTokens?: number | undefined;
+        cachedTokens?: number | undefined;
+      }
+    | undefined,
+): void {
+  if (!tokens) return;
+  if (turn.cachedInputTokens === undefined && tokens.cachedTokens !== undefined) {
+    turn.cachedInputTokens = tokens.cachedTokens;
+  }
+  if (turn.outputTokens === undefined && tokens.candidateTokens !== undefined) {
+    turn.outputTokens = tokens.candidateTokens;
+  }
+  if (tokens.promptTokens !== undefined) {
+    const totalInput = tokens.promptTokens + (tokens.cachedTokens ?? 0);
+    if (turn.inputTokens === undefined || turn.inputTokens < totalInput) {
+      turn.inputTokens = totalInput;
+    }
+  }
+}
+
+function buildToolSpan(
+  turn: InFlightTurn,
+  tool: InFlightToolCall,
+  endTimeUnixNano: string,
+  isError: boolean,
+  errorMessage?: string,
+): OtelSpan {
+  const toolAttrs: Record<string, unknown> = {
+    "gen_ai.tool.name": tool.toolName,
+    "gen_ai.tool.call.id": tool.toolCallId,
+  };
+  if (tool.command && tool.command !== tool.toolName) {
+    toolAttrs["tool.command"] = tool.command;
+  }
+
+  return {
+    traceId: turn.traceId,
+    spanId: tool.spanId,
+    parentSpanId: turn.spanId,
+    name: `execute_tool ${tool.toolName}`,
+    kind: SPAN_KIND.INTERNAL,
+    startTimeUnixNano: tool.startTimeUnixNano,
+    endTimeUnixNano,
+    attributes: toOtelKeyValues(toolAttrs),
+    status: {
+      code: isError ? STATUS_CODE.ERROR : STATUS_CODE.OK,
+      ...(isError && errorMessage ? { message: errorMessage } : {}),
+    },
+  };
+}
+
 function closeRemainingTools(turn: InFlightTurn, endTimeUnixNano: string, isError: boolean): void {
   for (const tool of turn.toolCalls.values()) {
-    const toolSpan: OtelSpan = {
-      traceId: turn.traceId,
-      spanId: tool.spanId,
-      parentSpanId: turn.spanId,
-      name: `execute_tool ${tool.toolName}`,
-      kind: SPAN_KIND.INTERNAL,
-      startTimeUnixNano: tool.startTimeUnixNano,
-      endTimeUnixNano,
-      attributes: toOtelKeyValues({
-        "gen_ai.tool.name": tool.toolName,
-      }),
-      status: {
-        code: isError ? STATUS_CODE.ERROR : STATUS_CODE.OK,
-      },
-    };
-    turn.orderedCompletedTools.push(toolSpan);
+    turn.orderedCompletedTools.push(buildToolSpan(turn, tool, endTimeUnixNano, isError));
   }
   turn.toolCalls.clear();
 }
@@ -182,19 +244,23 @@ export class SessionTurnTracker {
   }
 
   formatPromptText(prompt: string | PromptContentItem[]): string {
-    if (typeof prompt === "string") return prompt;
-    if (!Array.isArray(prompt)) return String(prompt ?? "");
+    const rawText =
+      typeof prompt === "string"
+        ? prompt
+        : Array.isArray(prompt)
+          ? prompt
+              .map((item) => {
+                if (!item || typeof item !== "object") return "";
+                if (item.type === "text" && typeof item.text === "string") {
+                  return item.text;
+                }
+                return `[${item.type || "content"}]`;
+              })
+              .filter(Boolean)
+              .join("\n")
+          : String(prompt ?? "");
 
-    return prompt
-      .map((item) => {
-        if (!item || typeof item !== "object") return "";
-        if (item.type === "text" && typeof item.text === "string") {
-          return item.text;
-        }
-        return `[${item.type || "content"}]`;
-      })
-      .filter(Boolean)
-      .join("\n");
+    return stripSystemContext(rawText).trim();
   }
 
   startTurn(
@@ -264,7 +330,12 @@ export class SessionTurnTracker {
     turn.responseChunks.push(text);
   }
 
-  recordToolCall(sessionId: string, toolCallId: string, toolName: string): void {
+  recordToolCall(
+    sessionId: string,
+    toolCallId: string,
+    toolName: string,
+    command?: string | undefined,
+  ): void {
     const turn = this.activeTurnsBySession.get(sessionId);
     if (!turn) return;
 
@@ -272,6 +343,7 @@ export class SessionTurnTracker {
       turn.toolCalls.set(toolCallId, {
         toolCallId,
         toolName: toolName || "tool",
+        command,
         spanId: generateSpanId(),
         startTimeUnixNano: nowUnixNano(),
         status: "in_progress",
@@ -296,24 +368,9 @@ export class SessionTurnTracker {
     const isFailure = status === "failed";
     tool.status = isFailure ? "failed" : "completed";
 
-    const toolSpan: OtelSpan = {
-      traceId: turn.traceId,
-      spanId: tool.spanId,
-      parentSpanId: turn.spanId,
-      name: `execute_tool ${tool.toolName}`,
-      kind: SPAN_KIND.INTERNAL,
-      startTimeUnixNano: tool.startTimeUnixNano,
-      endTimeUnixNano: endNano,
-      attributes: toOtelKeyValues({
-        "gen_ai.tool.name": tool.toolName,
-      }),
-      status: {
-        code: isFailure ? STATUS_CODE.ERROR : STATUS_CODE.OK,
-        ...(isFailure ? { message: "tool call failed" } : {}),
-      },
-    };
-
-    turn.orderedCompletedTools.push(toolSpan);
+    turn.orderedCompletedTools.push(
+      buildToolSpan(turn, tool, endNano, isFailure, isFailure ? "tool call failed" : undefined),
+    );
     turn.toolCalls.delete(toolCallId);
   }
 
@@ -337,13 +394,22 @@ export class SessionTurnTracker {
   }
 
   private reconcileTokens(turn: InFlightTurn, sessionId: string, customDbPath?: string): void {
-    if (turn.inputTokens !== undefined && turn.outputTokens !== undefined) return;
-    const dbUsage = this.extractDatabaseUsage(sessionId, customDbPath);
-    if (!dbUsage) return;
-    if (turn.inputTokens === undefined) turn.inputTokens = dbUsage.promptTokens;
-    if (turn.outputTokens === undefined) turn.outputTokens = dbUsage.candidateTokens;
-    if (turn.cachedInputTokens === undefined && dbUsage.cachedTokens) {
-      turn.cachedInputTokens = dbUsage.cachedTokens;
+    if (
+      turn.inputTokens !== undefined &&
+      turn.outputTokens !== undefined &&
+      turn.cachedInputTokens !== undefined
+    ) {
+      return;
+    }
+
+    const dbPath = customDbPath ?? getConversationDbPath(sessionId);
+    applyTokensToTurn(turn, readTokensFromDb(dbPath));
+    if (
+      turn.inputTokens === undefined ||
+      turn.outputTokens === undefined ||
+      turn.cachedInputTokens === undefined
+    ) {
+      applyTokensToTurn(turn, this.extractDatabaseUsage(sessionId, customDbPath) ?? undefined);
     }
   }
 
@@ -432,11 +498,12 @@ export class SessionTurnTracker {
     try {
       const usage = getLatestSessionUsage(sessionId, customDbPath);
       if (!usage) return null;
+      if (usage.cachedTokens !== undefined) return usage;
       const dbPath = customDbPath ?? getConversationDbPath(sessionId);
-      const cachedTokens = readCachedTokensFromDb(dbPath);
+      const dbTokens = readTokensFromDb(dbPath);
       return {
         ...usage,
-        ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+        ...(dbTokens?.cachedTokens !== undefined ? { cachedTokens: dbTokens.cachedTokens } : {}),
       };
     } catch {
       return null;

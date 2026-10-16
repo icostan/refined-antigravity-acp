@@ -37,6 +37,25 @@ describe("missing-usage-metrics unit tests", () => {
     expect(extracted?.candidateTokens).toBe(500);
     expect(extracted?.usedTokens).toBe(12500);
     expect(extracted?.maxTokens).toBe(1000000);
+    expect(extracted?.cachedTokens).toBeUndefined();
+
+    // With field 5 (cached tokens: varint 8000 = [0xc0, 0x3e])
+    // subfield 5 tag = (5 << 3) | 0 = 40 = 0x28
+    const f9WithCached = new Uint8Array([0x10, 0xe0, 0x5d, 0x18, 0xf4, 0x03, 0x28, 0xc0, 0x3e]);
+    const bufWithCached = new Uint8Array([
+      0x4a,
+      0x09,
+      ...f9WithCached,
+      0xc2,
+      0x01,
+      0x04,
+      ...f24Inner,
+    ]);
+    const extractedCached = extractUsageFromMetadata(bufWithCached);
+    expect(extractedCached?.cachedTokens).toBe(8000);
+    expect(extractedCached?.promptTokens).toBe(12000);
+    expect(extractedCached?.candidateTokens).toBe(500);
+    expect(extractedCached?.usedTokens).toBe(20500);
   });
 
   it("formats standard ACP usage_update notifications with token counts and context size", () => {

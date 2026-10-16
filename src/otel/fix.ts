@@ -59,6 +59,73 @@ function handlePromptResponse(
   });
 }
 
+function extractCommandFromRaw(rawInput: unknown): string | undefined {
+  if (!rawInput || typeof rawInput !== "object") return undefined;
+  const raw = rawInput as Record<string, unknown>;
+  if (typeof raw.CommandLine === "string") return raw.CommandLine;
+  if (typeof raw.command === "string") return raw.command;
+  return undefined;
+}
+
+function inferToolFromRaw(rawInput: unknown): string {
+  if (rawInput && typeof rawInput === "object") {
+    const raw = rawInput as Record<string, unknown>;
+    if ("CommandLine" in raw) return "run_command";
+    if ("AbsolutePath" in raw || "TargetFile" in raw || "targetFile" in raw) return "view_file";
+  }
+  return "run_command";
+}
+
+function cleanToolName(name?: string | null): string | undefined {
+  if (typeof name !== "string") return undefined;
+  const trimmed = name.replace(/^Running:?\s+/i, "").trim();
+  return trimmed || undefined;
+}
+
+function inferFromTitle(title: string, rawInput: unknown): { toolName: string; command?: string } {
+  const cleaned = cleanToolName(title);
+  if (cleaned && /^[a-zA-Z0-9_-]+$/.test(cleaned)) {
+    return { toolName: cleaned };
+  }
+  return {
+    toolName: inferToolFromRaw(rawInput),
+    command: title,
+  };
+}
+
+function resolveCommand(
+  title: string | undefined,
+  toolName: string,
+  existingCommand?: string,
+): string | undefined {
+  if (existingCommand || !title) return existingCommand;
+  if (title === toolName || title === `Running ${toolName}`) return undefined;
+  return title;
+}
+
+export function resolveToolName(update: {
+  name?: string | null | undefined;
+  tool?: string | null | undefined;
+  title?: string | null | undefined;
+  rawInput?: unknown;
+}): { toolName: string; command?: string | undefined } {
+  let command = extractCommandFromRaw(update.rawInput);
+  let toolName = cleanToolName(update.name) ?? cleanToolName(update.tool);
+  const title = typeof update.title === "string" ? update.title.trim() : undefined;
+
+  if (!toolName && title) {
+    const inferred = inferFromTitle(title, update.rawInput);
+    toolName = inferred.toolName;
+    command ??= inferred.command;
+  }
+
+  const finalToolName = toolName || "tool";
+  return {
+    toolName: finalToolName,
+    command: resolveCommand(title, finalToolName, command),
+  };
+}
+
 function handleToolUpdate(
   update: NonNullable<SessionUpdateParams["update"]>,
   sessionId: string,
@@ -71,13 +138,21 @@ function handleToolUpdate(
     title?: string;
     tool?: string;
     name?: string;
+    rawInput?: unknown;
+    arguments?: unknown;
     status?: string;
   };
   const callId = call.toolCallId || call.callId || call.id;
   if (!callId) return;
 
   if (update.sessionUpdate === SESSION_UPDATES.TOOL_CALL) {
-    tracker.recordToolCall(sessionId, callId, call.title || call.tool || call.name || "tool");
+    const { toolName, command } = resolveToolName({
+      name: call.name,
+      tool: call.tool,
+      title: call.title,
+      rawInput: call.rawInput ?? call.arguments,
+    });
+    tracker.recordToolCall(sessionId, callId, toolName, command);
   } else if (update.sessionUpdate === SESSION_UPDATES.TOOL_CALL_UPDATE && call.status) {
     tracker.updateToolCall(sessionId, callId, call.status);
   }

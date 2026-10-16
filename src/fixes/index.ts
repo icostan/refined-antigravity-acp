@@ -49,6 +49,7 @@ export * from "../otel/index.js";
  */
 export function createDefaultFixes(): AcpFix[] {
   return [
+    createTelemetryFix(),
     missingLocalharnessFix,
     missingSystemPromptFix,
     missingSlashSkillsFix,
@@ -68,6 +69,5 @@ export function createDefaultFixes(): AcpFix[] {
     nonCanonicalModeIdsFix,
     missingQuestionFallbackFix,
     prematureTurnStopFix,
-    createTelemetryFix(),
   ];
 }

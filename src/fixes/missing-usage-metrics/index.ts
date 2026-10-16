@@ -32,6 +32,7 @@ export interface TokenUsage {
   maxTokens: number;
   promptTokens: number;
   candidateTokens: number;
+  cachedTokens?: number | undefined;
 }
 
 export function extractUsageFromMetadata(metadata: Uint8Array): TokenUsage | null {
@@ -40,15 +41,17 @@ export function extractUsageFromMetadata(metadata: Uint8Array): TokenUsage | nul
 
   const promptTokens = getVarintField(f9, 2) ?? 0;
   const candidateTokens = getVarintField(f9, 3) ?? 0;
+  const cachedTokens = getVarintField(f9, 5) ?? 0;
 
   const maxTokens = getVarintField(getField(metadata, 24), 4) ?? 1_000_000;
-  const usedTokens = promptTokens + candidateTokens;
+  const usedTokens = promptTokens + candidateTokens + cachedTokens;
 
   return {
     usedTokens,
     maxTokens,
     promptTokens,
     candidateTokens,
+    cachedTokens: cachedTokens > 0 ? cachedTokens : undefined,
   };
 }
 
@@ -91,14 +94,16 @@ export function createUsageUpdateMessage(sessionId: string, usage: TokenUsage): 
 function attachUsageToResult(msg: AcpStreamMessage, usage: TokenUsage): AcpStreamMessage {
   if (!("result" in msg) || !msg.result || typeof msg.result !== "object") return msg;
   const resultObj = msg.result as Record<string, unknown>;
+  const totalInputTokens = usage.promptTokens + (usage.cachedTokens ?? 0);
   return {
     ...msg,
     result: {
       ...resultObj,
       usage: {
         totalTokens: usage.usedTokens,
-        inputTokens: usage.promptTokens,
+        inputTokens: totalInputTokens,
         outputTokens: usage.candidateTokens,
+        ...(usage.cachedTokens !== undefined ? { cachedTokens: usage.cachedTokens } : {}),
         contextWindowMaxTokens: usage.maxTokens,
         contextWindowUsedTokens: usage.usedTokens,
       },
