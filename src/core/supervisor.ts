@@ -1,3 +1,4 @@
+import { existsSync, statSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import {
@@ -34,6 +35,7 @@ import {
 } from "./session-cache.js";
 
 import { defaultSpawnProcess, traceAcp, writeJsonMessage } from "./transport.js";
+import { getConversationDbPath } from "../fixes/orphaned-checkpoints/index.js";
 
 export {
   RECYCLE_ID_PREFIX,
@@ -43,10 +45,30 @@ export {
   RECYCLE_CONFIG_PREFIX,
 };
 
-const DEFAULT_RECYCLE_TIMEOUT_MS = 60_000;
-const DEFAULT_RECYCLE_SPAWN_ATTEMPTS = 3;
-const DEFAULT_RECYCLE_RETRY_DELAY_MS = 500;
-const DEFAULT_PROMPT_SETTLE_TIMEOUT_MS = 0;
+export const DEFAULT_RECYCLE_TIMEOUT_MS = 180_000;
+export const DEFAULT_RECYCLE_SPAWN_ATTEMPTS = 3;
+export const DEFAULT_RECYCLE_RETRY_DELAY_MS = 500;
+export const DEFAULT_PROMPT_SETTLE_TIMEOUT_MS = 0;
+export const LOAD_TIMEOUT_PER_MB_MS = 500;
+
+export function computeSessionLoadTimeout(
+  sessionId: string,
+  baseTimeoutMs: number = DEFAULT_RECYCLE_TIMEOUT_MS,
+  customDbPath?: string,
+): number {
+  try {
+    const dbPath = customDbPath ?? getConversationDbPath(sessionId);
+    if (existsSync(dbPath)) {
+      const stats = statSync(dbPath);
+      const sizeMb = stats.size / (1024 * 1024);
+      const additionalMs = Math.round(sizeMb * LOAD_TIMEOUT_PER_MB_MS);
+      return Math.max(baseTimeoutMs, baseTimeoutMs + additionalMs);
+    }
+  } catch {
+    // If db stats cannot be read, fall back to base timeout
+  }
+  return baseTimeoutMs;
+}
 
 function parseEnvMs(val: string | undefined, defaultMs: number): number {
   if (!val) return defaultMs;
@@ -122,6 +144,7 @@ export interface SupervisorOptions {
   recycleRetryDelayMs?: number | undefined;
   /** Watchdog timeout in ms to synthesize terminal prompt response when upstream hangs after usage_update. */
   promptSettlementTimeoutMs?: number | undefined;
+  customDbPathGetter?: ((sessionId: string) => string) | undefined;
 }
 
 export class ProcessSupervisor implements CoreContext {
@@ -139,6 +162,7 @@ export class ProcessSupervisor implements CoreContext {
   private readonly recycleSpawnAttempts: number;
   private readonly recycleRetryDelayMs: number;
   private readonly promptSettlementTimeoutMs: number;
+  private readonly customDbPathGetter?: ((sessionId: string) => string) | undefined;
   private readonly promptSettlementTimers = new Map<string, NodeJS.Timeout>();
   private readonly activePrompts = new Map<string, string | number>();
   private readonly pendingRequests = new Map<string | number, PendingInternalRequest>();
@@ -170,6 +194,7 @@ export class ProcessSupervisor implements CoreContext {
         process.env.REFINED_AGY_PROMPT_SETTLE_TIMEOUT_MS,
         DEFAULT_PROMPT_SETTLE_TIMEOUT_MS,
       );
+    this.customDbPathGetter = options.customDbPathGetter;
 
     this.baseContext = {
       sessionCache: this.sessionCache,
@@ -690,7 +715,15 @@ export class ProcessSupervisor implements CoreContext {
     } as unknown as AcpStreamMessage;
 
     const transformedLoad = await this.pipeline.applyOutbound(loadMsg, context);
-    await this.sendInternalRequest(transformedLoad ?? loadMsg);
+    const customDbPath = this.customDbPathGetter
+      ? this.customDbPathGetter(session.sessionId)
+      : undefined;
+    const loadTimeoutMs = computeSessionLoadTimeout(
+      session.sessionId,
+      this.recycleTimeoutMs,
+      customDbPath,
+    );
+    await this.sendInternalRequest(transformedLoad ?? loadMsg, loadTimeoutMs);
   }
 
   private async resyncSessionMode(
